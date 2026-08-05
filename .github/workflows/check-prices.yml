@@ -1,0 +1,63 @@
+name: Check gold prices every 5 minutes
+
+# GitHub throttles/skips short "*/5" schedules, so we trigger hourly (which it
+# honours far more reliably) and poll every 5 minutes from inside the job.
+# That way the 5-minute cadence holds even when the trigger itself is late.
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+# If an hourly run is late and overlaps the previous one, queue it instead of
+# running two pollers at once.
+concurrency:
+  group: price-check
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - name: Poll /api/cron-check every 5 minutes for one hour
+        env:
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CRON_TOKEN:-}" ]; then
+            echo "::error::CRON_TOKEN repository secret is not set."
+            exit 1
+          fi
+
+          ENDPOINT="https://xrysi-lira-live.vercel.app/api/cron-check"
+          PINGS=12
+          failures=0
+
+          for i in $(seq 1 "$PINGS"); do
+            # Token goes in the URL but is never echoed; GitHub also masks
+            # secret values in logs.
+            code=$(curl -sS -o /tmp/resp.json -w "%{http_code}" --max-time 120 \
+              "${ENDPOINT}?token=${CRON_TOKEN}" || echo "000")
+
+            echo "[$(date -u '+%H:%M:%SZ')] ping ${i}/${PINGS} -> HTTP ${code}"
+
+            if [ "$code" = "200" ]; then
+              cat /tmp/resp.json; echo
+            else
+              failures=$((failures + 1))
+              echo "::warning::non-200 response (HTTP ${code})"
+              cat /tmp/resp.json 2>/dev/null || true
+              echo
+            fi
+
+            if [ "$i" -lt "$PINGS" ]; then
+              sleep 300
+            fi
+          done
+
+          echo "done: ${failures}/${PINGS} pings failed"
+          if [ "$failures" -gt 0 ]; then
+            echo "::error::${failures} of ${PINGS} pings did not return HTTP 200"
+            exit 1
+          fi
