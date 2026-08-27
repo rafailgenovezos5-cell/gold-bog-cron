@@ -3,13 +3,29 @@ name: Check gold prices every 5 minutes
 # GitHub throttles/skips short "*/5" schedules, so we trigger hourly (which it
 # honours far more reliably) and poll every 5 minutes from inside the job.
 # That way the 5-minute cadence holds even when the trigger itself is late.
+#
+# 2026-08-27: even the hourly trigger turned out to be unreliable. Observed
+# gaps between runs grew from ~1h to 2.7h to 5.2h and then stopped entirely
+# for ~10 hours, which froze every price on the site. Scheduled workflows are
+# best-effort on shared runners and GitHub makes no delivery guarantee, so the
+# fix is to stop needing the trigger to be punctual: one run now polls for
+# almost six hours (the job limit is six), instead of one. A late trigger then
+# costs nothing, and only a silence longer than ~5.75h can open a gap at all.
+#
+# There is a second, independent safety net outside this repo: a Vercel cron
+# in the site's own vercel.json calls the same endpoint once a day. That can't
+# provide the 5-minute cadence (the Hobby plan caps crons at once per day) but
+# it does guarantee every source is refreshed daily even if Actions goes fully
+# quiet.
 on:
   schedule:
     - cron: "0 * * * *"
   workflow_dispatch: {}
 
-# If an hourly run is late and overlaps the previous one, queue it instead of
-# running two pollers at once.
+# One poller at a time. cancel-in-progress:false means a trigger arriving
+# mid-run is queued rather than dropped, so when the current ~5.75h run ends
+# the queued one takes over immediately — the runs chain together instead of
+# leaving a hole between them.
 concurrency:
   group: price-check
   cancel-in-progress: false
@@ -17,9 +33,10 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    # 5h50m of polling plus headroom, just under the 6h hosted-runner ceiling.
+    timeout-minutes: 355
     steps:
-      - name: Poll /api/cron-check every 5 minutes for one hour
+      - name: Poll /api/cron-check every 5 minutes
         env:
           CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
         run: |
@@ -31,7 +48,8 @@ jobs:
           fi
 
           ENDPOINT="https://xrysi-lira-live.vercel.app/api/cron-check"
-          PINGS=12
+          # 70 pings, 5 minutes apart => 69 * 5 = 345 minutes of coverage.
+          PINGS=70
           failures=0
 
           for i in $(seq 1 "$PINGS"); do
@@ -57,7 +75,11 @@ jobs:
           done
 
           echo "done: ${failures}/${PINGS} pings failed"
-          if [ "$failures" -gt 0 ]; then
+          # Over nearly six hours an occasional blip (a slow scrape, a Vercel
+          # cold start) is expected and does not mean the job failed at its
+          # purpose. Only a majority of failures indicates something genuinely
+          # broken worth a red run and an email.
+          if [ "$failures" -gt $((PINGS / 2)) ]; then
             echo "::error::${failures} of ${PINGS} pings did not return HTTP 200"
             exit 1
           fi
